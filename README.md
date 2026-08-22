@@ -5,7 +5,7 @@
 
 自动领取 **WorkBuddy** 每日积分（**100 积分/天，连续第 7 天 1000 积分**）的本地签到脚本。全流程在本机完成：读取本地登录态 → 调用腾讯官方签到接口，**无任何后端服务**。
 
-> 本仓库是 [workbuddy-checkin](https://github.com/) WorkBuddy 技能的开源版本，已移除所有个人身份信息，可直接分发使用。
+> 本仓库是 [workbuddy-checkin](https://github.com/leo372239-1024/workbuddy-checkin-opensource) WorkBuddy 技能的开源版本，已移除所有个人身份信息，可直接分发使用。
 
 ## ✨ 特性
 
