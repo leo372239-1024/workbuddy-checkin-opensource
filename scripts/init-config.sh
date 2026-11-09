@@ -79,9 +79,29 @@ elif [ "$N_UIDS" -eq 1 ]; then
 else
   echo ""
   echo "⚠️  本机存在 $N_UIDS 个不同账号，无法自动决定给哪个账号签到："
-  printf '%s\n' "$TABLE" | awk -F$'\x1f' '{printf "   uid=%s  文件=%s  类型=%s  昵称=%s\n",$3,$1,$2,($4==""?"(加密读不到)":$4)}'
   echo ""
-  echo "请指定：bash scripts/init-config.sh --uid <上面某个 uid>"
+  # 按 uid 去重，只展示每个账号最合适的那份登录态（当前登录态优先、其次最新）
+  "$NODE_BIN" -e '
+    const fs=require("fs");
+    const lines=fs.readFileSync(0,"utf8").split(/\r?\n/).filter(Boolean);
+    const rows=lines.map(l=>{const p=l.split("\x1f");
+      return {f:p[0],tt:p[1],u:p[2],nick:p[3]||"",mt:Number(p[4])||0};});
+    const byUid=new Map();
+    for(const r of rows){
+      const cur=byUid.get(r.u);
+      const pri=x=>/^workbuddy-desktop(-ai)?\.info$/.test(x.f)?0:1;
+      if(!cur || pri(r)<pri(cur) || (pri(r)===pri(cur) && r.mt>cur.mt)) byUid.set(r.u,r);
+    }
+    let i=0;
+    for(const [uid,r] of byUid){
+      i++;
+      const nick=r.nick||"(昵称加密读不到)";
+      console.log(`  ${i}. uid=${uid}   昵称=${nick}   优先源=${r.f} (${r.tt})`);
+    }
+  ' <<< "$TABLE"
+  echo ""
+  echo "请用上面某个完整 uid 重新执行，例如："
+  echo "  bash scripts/init-config.sh --uid <完整 uid>"
   echo "（选错账号 = 积分进错号，所以这里不做自动选择）"
   exit 2
 fi
