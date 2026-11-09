@@ -15,7 +15,3 @@ __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
-
-# 本地构建辅助（不入库）
-/_mktree.py
-/_tree.json
