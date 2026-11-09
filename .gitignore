@@ -1,10 +1,21 @@
-# 运行日志（含签到结果，不含令牌，但无需入库）
-logs/
-*.log
+# 本机配置（含账号名/uid/仓库名，因人而异）
+/config.env
 
-# 敏感凭据（登录态快照，等同账号密码，绝不入库）
-auth/
+# 令牌快照（等同账号密码，绝不能提交）
+/auth/
+/.runtime/
 
-# 系统文件
+# 运行产物
+/logs/
+/local/
+/cloud/
+
+# 语言/编辑器杂项
+__pycache__/
+*.pyc
 .DS_Store
 Thumbs.db
+
+# 本地构建辅助（不入库）
+/_mktree.py
+/_tree.json

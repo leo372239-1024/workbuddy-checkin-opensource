@@ -1,320 +1,362 @@
 ---
 name: workbuddy-checkin
-description: WorkBuddy 每日积分自动签到。自动解密本地登录令牌，调用官方签到 API 完成每日积分领取（100 积分/天，连续第 7 天 1000 积分），并支持配置定时任务。触发词：WorkBuddy 签到、每日积分、check-in、credits、为 workbuddy 目前登录的账号创建云端+本地自动签到任务。触发：当说"为 workbuddy 目前登录的账号创建云端+本地自动签到任务"或涉及 WorkBuddy 多账号隔离/快照时，按"创建云端 GitHub Actions + 本地 Windows 任务计划程序双保险签到任务"流程处理（云端默认每天00:05北京时间、本地每天11:00/21:00，任务名带账号名后缀）；多账号并存用 WB_CHECKIN_AUTH_FILE 指向各账号登录态快照 + Secrets 后缀（_2）彻底隔离，月度快照自动保鲜。
-version: "1.3.0"
+description: WorkBuddy 每日积分自动签到（开源版）。读取本机桌面端登录态（支持 v5.6+ $wbEncrypted 信封解密），调用腾讯官方签到接口领取每日积分（100/天，连续第 7 天 1000），并引导用户完成「云端 GitHub Actions + 本地定时任务」双保险部署。触发词：WorkBuddy 签到、每日积分、check-in、credits、自动签到、签到失败告警、token 过期、快照保鲜、按链接安装这个 skill。安装入口：用户发来 https://github.com/leo372239-1024/workbuddy-checkin-opensource 并要求安装时，按「首次部署协议」六阶段逐段执行，每阶段先说明再动手，阶段 3 未通过不得进入阶段 4/5。
+version: "2.0.0"
 license: MIT
 ---
 
-# WorkBuddy 每日积分签到
+# WorkBuddy 自动签到
 
-自动领取 WorkBuddy 每日积分（100 积分/天，连续第 7 天 1000 积分）。
-全流程在本机完成：读取本地登录态 → 调用腾讯官方签到接口。无后端服务。
+自动领取 WorkBuddy 每日积分。本机读取登录态 → 调用腾讯官方接口，无第三方后端。
 
-## 原理
+本 skill 有两种使用形态，**先判断属于哪一种**：
 
-1. WorkBuddy 桌面端登录后，会在本地保存登录态。**v5.3.8+ 的新版桌面端**改为明文 JSON 文件：
-   - macOS：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
-   - 结构 `{ account, auth: { accessToken, refreshToken, expiresAt, ... }, accounts }`，桌面端临近过期会自动刷新，纯 Node 即可读取 `auth.accessToken`。
-2. **旧版 WorkBuddy/CodeBuddy** 仍把 auth session 用 Electron `safeStorage` 加密存于 `state.vscdb`；新版明文文件缺失时回退到此路径，用 Electron 运行时执行 `safeStorage.decryptString()` 解密（macOS 命中钥匙串；Windows/Linux 走 DPAPI/keyring）。
-3. 运行时策略：**Node 优先**（读新版明文文件，无需 Electron），缺失时回退 Electron（解旧版 `state.vscdb`）。
-4. 调用腾讯官方签到 API：
-   - 查状态：`POST https://copilot.tencent.com/v2/billing/meter/checkin-status`
-   - 执行签到：`POST https://copilot.tencent.com/v2/billing/meter/daily-checkin`
-   - 认证：`Authorization: Bearer <accessToken>`，并按桌面端 `buildHeaders` 附带 `X-User-Id: <account.uid>`；有 `auth.domain` 时加 `X-Domain`，企业账号另加 `X-Enterprise-Id` / `X-Tenant-Id`
-   - 兼容说明：`checkin.ps1` 走上述 `/v2/` 全量签名（对齐桌面端）；`checkin.sh` 仍走不带 `/v2/` 前缀、仅 `Authorization` 的旧写法。**两种写法实测均返回 200**（见 CHANGELOG 1.0.3 的验证矩阵），网关当前未强制 `/v2/` 或 `X-User-Id`；对齐桌面端属前向兼容加固，不是修复 401 的必要条件
-5. 脚本幂等：先查状态（命中即跳过）；`daily-checkin` 返回 `code=10001`（今天已签到）同样视为成功，避免重复请求被误报为失败。
+| 形态 | 判断依据 | 走哪里 |
+|---|---|---|
+| **A. 首次部署** | `config.env` 不存在，或用户刚发来安装链接 | 下面的「首次部署协议」 |
+| **B. 日常运行 / 排错** | `config.env` 已存在 | 「日常运维」+「排错」 |
 
-> ⚠️ v5.3.8 实测 `checkin-status` 的 `today_checked_in` 字段不可靠（签到成功后仍可能为 `false`）。因此幂等性主要靠 `daily-checkin` 的 `code=10001` 兜底。
+---
 
-兼容旧版应用名 `CodeBuddy`（仅旧版 `state.vscdb` 分支需要，macOS 需设环境变量 `WB_CHECKIN_APP_NAME=CodeBuddy`）。
+# 首次部署协议
 
-## 文件结构
+> **执行纪律（对 Agent）**
+> 1. **每阶段先告诉用户「现在做什么、为什么」，再执行**，不要一口气闷头跑完。
+> 2. **阶段之间有门禁**：阶段 3 未通过（本地签不到），**禁止**进入阶段 4/5。云端只会放大错误。
+> 3. **遇到阻塞就停下报告**，把原始错误贴给用户。不要静默降级、不要改用你自己的知识绕过。
+> 4. **绝不打印、绝不写入日志**任何 `accessToken`。需要展示时只显示 uid 前 8 位与剩余天数。
+> 5. **不要替用户决定账号与仓库名**。这些必须问出来。
 
+## 阶段 0 · 安装 skill
+
+**目标**：把仓库放到 Agent 的 skill 目录，让后续会话都能调用。
+
+```bash
+# 用户级（推荐，所有项目可见）
+SKILL_DIR="$HOME/.workbuddy/skills/workbuddy-checkin"
+
+if [ -d "$SKILL_DIR/.git" ]; then
+  git -C "$SKILL_DIR" pull --ff-only        # 已装过 → 只更新
+else
+  mkdir -p "$(dirname "$SKILL_DIR")"
+  git clone https://github.com/leo372239-1024/workbuddy-checkin-opensource "$SKILL_DIR"
+fi
 ```
-workbuddy-checkin/
-├── SKILL.md
-├── references/
-│   └── dependencies.md         # 依赖清单与平台差异
-└── scripts/
-    ├── decrypt-token.js        # 解密令牌（跨平台）
-    ├── checkin.sh              # macOS / Linux / Git Bash
-    ├── checkin.ps1             # Windows PowerShell
-    ├── setup.sh                # macOS / Linux 一键安装
-    └── setup.ps1               # Windows 一键安装
+
+Windows 下的路径是 `%USERPROFILE%\.workbuddy\skills\workbuddy-checkin`，Git Bash 里 `$HOME` 已指向该目录。
+
+**判定**：目录内存在 `SKILL.md`、`scripts/checkin.sh`、`scripts/wb-detect.sh`。
+**失败**：网络不通时让用户手动下载 zip 解压到该目录，不要自己造脚本替代。
+
+> 旧版 WorkBuddy/CodeBuddy（登录态在 `state.vscdb`）才需要额外装 Electron：
+> `bash scripts/setup.sh`（macOS/Linux）或 `powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`。
+> 新版（v5.3.8+ 明文登录态）**跳过这步**。
+
+## 阶段 1 · 环境体检（只读，不改任何东西）
+
+```bash
+cd "$SKILL_DIR" && bash scripts/wb-detect.sh
 ```
 
-`logs/` 目录运行后自动创建，存放签到日志。
+**读法**：末尾会输出 `DETECT:KEY=VALUE` 机器行与结论。
+`退出码 0` = 全绿；`1` = 有告警可继续；`2` = 有硬阻塞，**必须停下**。
 
-## 依赖
+把 `[阻塞]` 项原文交给用户，并给出对应处置：
 
-### 系统依赖
+| 阻塞项 | 处置 |
+|---|---|
+| 未找到 Node.js | 装 Node 20+；或让用户在 `config.env` 写 `WB_NODE_BIN=<node 路径>` |
+| 未找到登录态目录 | 打开 WorkBuddy 桌面端**登录一次**，再重跑 |
+| 服务端返回 401 | 桌面端重新登录该账号，再重跑 |
+| 登录态是加密信封但无 `APP_EXE` | 让用户确认安装路径，写 `WB_APP_EXE=<...>/WorkBuddy.exe` |
 
-| 依赖 | 用途 | 安装方式 |
-|------|------|----------|
-| WorkBuddy 桌面端（已登录） | 提供本地登录态（v5.3.8+ 明文文件 / 旧版 `state.vscdb`） | 官网下载，必须登录过至少一次 |
-| Node.js（推荐 20+，v5.3.8+ 主路径必需） | 读取新版明文登录态、解析 JSON | nodejs.org 下载，或系统包管理器 |
-| curl（macOS/Linux 自带）/ curl.exe | 调用签到 API | Windows 10 1803+ 自带 |
-| Electron 运行时（≥ 30，推荐 37） | **仅旧版** `state.vscdb` 分支解密令牌用 | 仅旧版账户需要，运行 `scripts/setup.sh` 或 `setup.ps1` |
+> 这一步会向腾讯接口发一次 `checkin-status`（只读查询，不领取）。若用户介意触网，加 `--no-net`。
 
-> v5.3.8+ 用户：装好 Node.js 并登录桌面端即可直接签到，**无需安装 Electron**。Electron 仅用于尚未迁移到新版明文存储的旧版 WorkBuddy/CodeBuddy 账户。
+## 阶段 2 · 生成本机配置
 
-### 开箱即用 vs 需安装
+```bash
+bash scripts/init-config.sh
+```
 
-- **开箱即用（v5.3.8+）**：已装 WorkBuddy 桌面端并登录 + 系统已有 Node.js → 直接运行签到脚本。
-- **需安装 Node.js**：提示「未找到 Node」时，到 nodejs.org 安装，或用 `WB_CHECKIN_NODE=<path>` 指定。
-- **旧版账户需 Electron**：使用旧版 WorkBuddy/CodeBuddy（`state.vscdb`）且提示「未找到 Electron」时，执行：
+它复用阶段 1 的探测结果写 `config.env`，**不覆盖已有值**（要覆盖加 `--force`）。
+写入项：`WB_ACCOUNT_NAME` / `WB_ACCOUNT_UID` / `WB_ACCOUNT_FILE` / `WB_APP_EXE` / `WB_API_BASE`。
 
-  ```bash
-  # macOS / Linux
-  bash scripts/setup.sh
-  # Windows（PowerShell）
-  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-  ```
+**判定**：`config.env` 存在，且 `WB_ACCOUNT_UID` 非空。
+**注意**：该文件已 `.gitignore`，不要 `git add -f`。
 
-### 可选 / 回退依赖
+## 阶段 3 · 本地跑通（门禁，必须成功）
 
-| 依赖 | 缺失时行为 |
-|------|------------|
-| Electron 运行时 | 仅旧版 `state.vscdb` 账户需要；v5.3.8+ 新版明文路径不需要 |
-| Node.js 内置 `node:sqlite`（Electron 37 / Node 22+ 自带） | 旧版分支自动回退到 `python3` 读取 sqlite |
-| `python3` | sh 版 JSON 解析降级为 `unknown`，签到请求仍会执行 |
-| `npm`（仅旧版 setup 首次安装 Electron 用） | 手动放置 Electron 后用 `WB_CHECKIN_ELECTRON=<path>`（sh）/ `-ElectronPath <path>`（ps1）指定 |
+```bash
+bash scripts/checkin.sh
+```
 
-完整依赖说明见 `references/dependencies.md`。
+**通过标准**——日志里出现以下之一：
 
-## 快速开始
+- `🎉 签到成功！领取 OK credit=100 streak_days=N`
+- `✅ 今日已签到`
+
+**不通过**的三种典型输出与含义：
+
+| 输出 | 含义 | 处置 |
+|---|---|---|
+| `❌ 令牌已过期或无权限（HTTP 401/403）` | 令牌真失效 | 桌面端重新登录 → 重跑 |
+| `❌ 查询签到状态失败（网络异常）` | 连不上接口 | 查代理/DNS；**这不代表令牌失效** |
+| `❌ 获取令牌失败（...）` | 读不到登录态 | 回阶段 1 看 `[阻塞]` 项 |
+
+**门禁**：只有这一阶段通过，才继续。云端部署会把本机问题放大成"每天静默失败"。
+
+## 阶段 4 · 云端兜底（可选，需要 `gh`）
+
+**先问用户三个问题**，不要替他决定：
+
+1. **要不要云端兜底？** 好处：电脑关机也能签；代价：令牌会以 Secret 形式存在你 GitHub 账号里。
+2. **仓库名用什么？** 默认 `<你的登录名>/workbuddy-checkin-cloud`（私有）。
+3. **要不要失败邮件告警？** 需要提供 SMTP 服务器/端口/账号/授权码/收件人。
+
+**如果用户不需要云端** → 直接跳到阶段 5，只装本地任务。
+
+```bash
+bash scripts/cloud-init.sh --verify      # --at 08:30 可改北京时间，默认 00:05
+```
+
+它做的事：`gh repo create`（私有）→ 铺模板 → 提交推送 → `gh secret set` 三件套 → 触发一次验证。
+
+**必须在阶段 4 说清的两件事**（否则用户预期会错）：
+
+- **Actions 定时任务会延迟 3~4 小时**。云端是"当天最后一道保险"，不是凌晨准点补签。
+- **云端靠 Secret 里的令牌，令牌不会自己续期**。所以阶段 5 的保鲜任务不是可选项。
+
+### 邮件告警（可选）
+
+```bash
+gh secret set MAIL_SMTP_HOST --repo <owner/repo> --body "smtp.example.com"
+gh secret set MAIL_SMTP_PORT --repo <owner/repo> --body "465"
+gh secret set MAIL_USERNAME  --repo <owner/repo> --body "you@example.com"
+gh secret set MAIL_PASSWORD  --repo <owner/repo>   # 交互输入，不要回显、不要写进文件
+gh secret set MAIL_FROM      --repo <owner/repo> --body "you@example.com"
+gh secret set MAIL_TO        --repo <owner/repo> --body "you@example.com"
+```
+
+**不配就走 GitHub Issue 通道**（`notify.py` 自动降级，用内置 `GITHUB_TOKEN`，无需额外凭据）。
+**校园/企业邮箱常封禁非内网 SMTP**，本机能发 ≠ Actions 能发。要验证就临时建一个 `workflow_dispatch` 自测 workflow，跑通后删掉。
+
+## 阶段 5 · 本地保鲜任务（必装）
+
+**为什么必装**：脚本能自动化的只有"把最新令牌搬运到 Secret"；能不能顺带续期取决于桌面端是否重建会话，脚本无法保证。
+**没有这个任务，云端会在令牌到期那天静默失效，而本地日志一切正常。**
+
+Windows：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\local-task.ps1 -Mode refresh -Days 10 -At 12:00
+```
 
 macOS / Linux：
+
 ```bash
-bash scripts/setup.sh     # 检测运行时并验证令牌链路（v5.3.8+ 用 Node，旧版才需 Electron）
-bash scripts/checkin.sh   # 立即签到一次（验证）
+bash scripts/local-cron.sh --mode refresh --days 10 --at 12:00
 ```
 
-Windows（PowerShell）：
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-powershell -ExecutionPolicy Bypass -File scripts\checkin.ps1
-```
+生成物（Windows）：`local/update_token.cmd` + 计划任务 `WB-Refresh-<账号>`。
+`.cmd` 里已自动配好 `HOME`、`PATH`（node/python/gh）、`PYTHONUTF8`、`WB_CHECKIN_APP_EXE`，**不要手改**——改完需重跑安装器。
 
-前提：本机已安装并**登录** WorkBuddy 桌面端；系统已安装 Node.js（v5.3.8+ 主路径）。
+> 如果用户还需要"本地每日补签"（例如没有 GitHub 账号），加 `-Mode both` 或多跑一次 `-Mode daily`。
+> **不要同时装本地每日任务和云端每日任务之外的第三份调度**（如 WorkBuddy 自动化），会重复触发。
 
-## 设置定时任务
+## 阶段 6 · 验收
 
-电脑非全天开机时，建议配置多个时间点补签（脚本幂等，重复运行无副作用）。推荐 `09:00 / 12:00 / 15:00 / 18:00 / 21:00` 各尝试一次，只要电脑在任一时间点开机就能签上。
+逐项确认，**不要只看退出码**：
 
-### macOS / Linux（crontab）
-```bash
-crontab -e
-0 9,12,15,18,21 * * * /path/to/scripts/checkin.sh >> /path/to/logs/checkin.log 2>&1
-```
-
-### Windows（任务计划程序，推荐）
-
-Windows 下推荐用 **schtasks（任务计划程序）** 而非 WorkBuddy 内部自动化：不依赖 WorkBuddy 进程常驻，开机即触发，且自带补签多时间点。**实测已落地（2026-08-19）**，方案如下。
-
-```powershell
-# 单任务只支持一个 /ST，多时间点需建多个任务（脚本幂等，多建无害）
-schtasks /Create /TN WB-DailyCheckin-<账号>-11 /TR "<你的项目路径>\workbuddy-checkin-opensource\daily_checkin.cmd" /SC DAILY /ST 11:00 /F
-schtasks /Create /TN WB-DailyCheckin-<账号>-21 /TR "<你的项目路径>\workbuddy-checkin-opensource\daily_checkin.cmd" /SC DAILY /ST 21:00 /F
-```
-
-**必须用仓库内现成的 `daily_checkin.cmd` 作为入口**（不要手写 `powershell -File checkin.ps1`），原因与 .cmd 内关键配置：
-
-| 配置 | 作用 | 踩坑经验 |
-|------|------|---------|
-| `set "HOME=C:\Users\<用户>"` | 任务计划环境无 HOME，不设则 `~` 失效 | 必配 |
-| `PATH` 显式加 `NODE_DIR` / `PY_DIR` / `GH_DIR` | 任务计划 PATH 是精简系统 PATH，不含 Node/Python/gh | 缺 python3 时 checkin.sh 结果解析降级为「unknown」 |
-| `PYTHONUTF8=1` | 强制 Python 输出 UTF-8 | 不设则 python 输出 GBK 与 echo 的 UTF-8 混排乱码 |
-| `chcp 65001 >nul` | 控制台代码页切 UTF-8 | 不设则 bash 输出被 cmd 按 GBK 解释，日志乱码 |
-| 重定向 `>> logs\daily.log 2>&1` | 日志落盘可事后排查 | 首次失败无日志=脚本没跑起来 |
-
-**校验**：`schtasks /Run /TN <任务名>` 手动触发 → 等 15~25s（脚本执行需几秒）→ `schtasks /Query /TN <任务名> /V /FO LIST` 看「上次结果」（0=成功）→ `cat logs\daily.log` 确认「签到结果 + 回传结果」。**注意：在 Git Bash 里 `cmd //c xxx.cmd` 会进交互式 shell 而非执行脚本，验证一律用 PowerShell 的 `schtasks /Run`**。
-
-> 停用旧方案：若旧环境已有 WorkBuddy 自动化任务（automation_update），将状态置为 `PAUSED` 而非删除（可回滚）；保留 ACTIVE 会造成**双调度**（两个 11:00 同时触发，虽幂等但日志重复）。
-
-### macOS launchd（长期后台）
-
-创建 `~/Library/LaunchAgents/com.user.workbuddy-checkin.plist`，`StartCalendarInterval` 用数组配置多时间点：
-```xml
-<key>StartCalendarInterval</key>
-<array>
-  <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
-  <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
-  <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
-  <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
-  <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>0</integer></dict>
-</array>
-```
-然后 `launchctl load ~/Library/LaunchAgents/com.user.workbuddy-checkin.plist`。
-
-### 在 WorkBuddy 内（Agent 自动化，不推荐 Windows 主方案）
-
-WorkBuddy 环境下可调用自动化任务工具（`automation_update`，recurring 类型），RRULE 多值 `BYHOUR` 实测生效。**Windows 下仅作为辅助/兜底**（需 WorkBuddy 进程运行），主方案用任务计划程序：
-```jsonc
-{
-  "name": "WorkBuddy 每日积分签到",
-  "scheduleType": "recurring",
-  "rrule": "FREQ=DAILY;BYHOUR=9,12,15,18,21;BYMINUTE=0;BYSECOND=0",
-  "cwds": ["<用户工作目录>"],
-  "status": "ACTIVE",
-  "prompt": "运行 Bash 脚本 scripts/checkin.sh（Windows 用 checkin.ps1）。该脚本幂等：今日已签到会直接跳过。读取输出并汇报：签到成功领取多少积分 / 今日已签到 / 令牌失效需打开 WorkBuddy 刷新。"
-}
-```
-> 注意：`update` 已有任务时必须显式传 `rrule`，否则可能被重置；`cwds` 不能用 Claw 工作区。
-
-## 触发：创建云端 + 本地双保险签到任务
-
-当用户说「为 workbuddy 目前登录的账号创建云端 + 本地自动签到任务」时，触发本技能并完成以下配置。**目标**：为**当前本机已登录的 WorkBuddy 账号**建立「云端 GitHub Actions + 本地 Windows 任务计划程序」两个每天定点（**云端默认 00:05 北京时间、本地默认 11:00**）的幂等签到任务，实现电脑关机也能签。
-
-前置：本机已安装并登录 WorkBuddy 桌面端（v5.3.8+ 明文登录态），且已安装 `workbuddy-checkin` 技能与 `workbuddy-checkin-opensource` 私有仓库（含 `daily_checkin.cmd` 入口脚本）。
-
-### 0. 读取当前登录账号名（任务名后缀来源）
-- 读取 `workbuddy-desktop.info`（`v5.3.8+` 明文）或 `state.vscdb`（旧版），取 **`account.nickname`** 作为 `ACCOUNT_NAME`（例如 `<账号名>`）。`account.uid` 仅用于云端 Secret，**不作为任务名**。
-- 云端 workflow name 与本地任务名都带 `ACCOUNT_NAME` 后缀。
-
-### 步骤
-
-1. **确认当前登录账号**：运行 `scripts/decrypt-token.js`（或直接读 `workbuddy-desktop.info`），取得 `account.uid` / `account.nickname` / `auth.domain` / `auth.accessToken`。后续云端与本地任务都围绕这个账号。
-2. **云端任务（GitHub Actions）**：
-   - 仓库 `<your-github-username>/workbuddy-checkin-opensource`，`.github/workflows/checkin.yml` 的 `cron` 设为目标时间对应 UTC（**默认 00:05 北京 = `5 16 * * *` UTC 前一日 16:05**）。用户指定其他时间则按需换算（北京 = UTC + 8）。
-   - workflow `name` 带账号后缀，例如 `WorkBuddy Daily Checkin - <账号名>`。
-   - 运行 `bash <你的项目路径>/workbuddy-checkin-opensource/sync_token.sh`，把**当前账号**的 `accessToken` / `uid` / `domain` 回传到仓库 Secrets，云端即以此账号签到。token 有效期 60 天，靠本地回传保鲜。
-   - **提交推送走代理**：`git -c http.proxy=http://<代理地址> push origin main`（若本机有代理，gh CLI 自动走代理但 git push 不继承，直连会被 reset）。
-3. **本地任务（Windows 任务计划程序，主方案）**：用 `schtasks /Create` 建任务，分工与云端不同——**云端 00:05 北京兜底关机场景，本地 11:00 本机补签 + 回传 token**。任务直接指向仓库内 `daily_checkin.cmd`（内含：签到幂等 + 回传 token，已配好 Node/Python/gh 路径与 UTF-8 日志），命令示例见上文「Windows（任务计划程序，推荐）」。**若旧环境已有 WorkBuddy 自动化任务（automation_update），应将状态置为 `PAUSED` 停用，避免双调度冲突**。
-4. **校验**：`schtasks /Query /TN <任务名> /V` 确认任务时间；`schtasks /Run /TN <任务名>` 手动触发一次，检查 `logs\daily.log` 输出（签到结果 + 回传结果）。云端 Secrets 刚更新时，可在仓库手动 `workflow_dispatch` 跑一次验证。
-
-> 不要为同一账号创建重复任务：若已存在同目标任务 / workflow，直接把时间 / 名称改为目标值，而非新建。WorkBuddy 自动化任务与 Windows 任务计划程序**二选一**，避免重复调度。
-
-## 多账号彻底隔离与快照保鲜（v1.3.0，2026-08-19 实战沉淀）
-
-> 适用场景：本机需要**多个 WorkBuddy 账号**各自独立签到（云端 + 本地互不影响）。
-> 根因：WorkBuddy 桌面端是**单账号登录态**（`workbuddy-desktop.info` 同一时刻只含一个账号），
-> 且桌面端登录态会随切换被覆盖。多账号并存**不能**依赖"当前登录态"。
-
-### 核心机制：登录态快照 + AUTH_FILE 指定
-
-1. **快照来源**：桌面端每次登录/切换账号都会在 auth 目录留存带时间戳的 `workbuddy-desktop.<ts>.<pid>.<uuid>.info` 文件（历史快照），其中包含完整 `account` + `auth`（accessToken/uid/domain）。**这些快照就是各账号的离线凭据源**。
-2. **指定读取**：设置 `WB_CHECKIN_AUTH_FILE=<快照路径>` 后，`decrypt-token.js` 优先读指定文件（v1.1.0+）；不设置则读当前登录态。`checkin.sh` / `sync_token.sh` 均透传该环境变量。
-3. **云端 Secrets 后缀隔离**：多账号各自用独立 Secrets，第二账号加 `_2` 后缀（`WORKBUDDY_ACCESS_TOKEN` vs `WORKBUDDY_ACCESS_TOKEN_2`，uid/domain 同理），回传脚本/云 workflow 各自引用，互不覆盖。
-
-### 完整部署流程（Windows 实测落地）
-
-```text
-仓库布局（workbuddy-checkin-opensource/）：
-├── auth/                        # 各账号登录态快照（gitignore！绝不入库）
-│   ├── <账号名>.info             # 账号A 快照
-│   └── <账号名B>.info          # 账号B 快照
-├── sync_snapshots.sh            # 快照同步脚本（月度保鲜用）
-├── daily_checkin.cmd            # 账号A 本地签到入口（设 AUTH_FILE=<账号名>.info）
-├── daily_checkin_2.cmd          # 账号B 本地签到入口（设 AUTH_FILE=<账号名B>.info）
-├── sync_token.sh                # 账号A 凭据回传（无后缀 Secrets）
-├── sync_token_2.sh              # 账号B 凭据回传（_2 后缀 Secrets）
-└── .github/workflows/
-    ├── checkin.yml              # 账号A 云端（无后缀 Secrets）
-    └── checkin-<账号名B>.yml   # 账号B 云端（_2 Secrets）
-```
-
-1. **取快照**：从 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\` 找到各账号最新的 `workbuddy-desktop.*.info`，复制到仓库 `auth/<账号>.info`。**注意 `auth/` 必须加入 `.gitignore`**（快照含 accessToken，等同账号密码）。
-2. **建云端 workflow**：每个账号一个 yml，cron 错开（如 A 00:05、B 00:10 北京时间），env 引用各自 Secrets。
-3. **建本地计划任务**：每个账号 11:00 + 21:00 两个 schtasks，各自 `.cmd` 内 `set "WB_CHECKIN_AUTH_FILE=...\auth\<账号>.info"` 后跑 `checkin.sh && sync_token.sh（或 _2）`。
-4. **回传凭据**：`sync_token.sh` 支持 `WB_CHECKIN_AUTH_FILE` 透传并回传 token/uid/domain 三件套，覆盖被污染的无后缀 Secrets。
-5. **验证隔离**（关键）：先本地 `schtasks /Run` 触发，确认日志里回传的是对应后缀 Secret；再云端 `workflow_dispatch` 两次，确认两个 workflow 各签各的账号（日志应显示不同账号的签到结果）。
-
-### 月度快照自动保鲜（token 60 天有效期闭环）
-
-accessToken 有效期约 60 天。只要用户每月在桌面端登录过该账号，auth 目录就会有新快照。做法：
-
-1. **`sync_snapshots.sh`**：扫描 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\` 全部 `workbuddy-desktop*.info`（含当前登录态 + 历史快照），解析每份的 `account.nickname`，按 nickname 匹配目标账号、取 mtime 最新一份，复制到仓库 `auth/<账号>.info`。
-2. **计划任务**：`schtasks /Create /TN WB-SnapshotSync-Monthly /SC MONTHLY /D 1 /ST 09:30 /TR <snapshot_sync.cmd>`，每月 1 号自动跑快照同步。
-3. 之后每日签到自动用新快照里的 token，**无需人工干预**。
-
-### 浏览器登录态提取（反面经验：不要走这条路）
-
-> 若用户提到"某账号在 Chrome/Edge 浏览器有登录信息"，**优先用桌面端快照方案**，不要尝试解密浏览器 cookie：
-> - Chrome 130+ / Edge 新版 cookie 使用 **App-Bound Encryption（v20 格式）**，解密需要 SYSTEM 权限 + `elevation_service.exe` 私钥（需 pypsexec 创建服务），风险极高且极易触发安全告警。
-> - 浏览器 Local Storage / IndexedDB 中通常只有 `uidsk`、beacon 等非凭据数据，accessToken 在 HttpOnly cookie 里（JS 读不到）。
-> - 结论：浏览器登录态仅作为"该账号确实存在"的线索；实际凭据一律从桌面端快照获取。
-
-## 平台说明
-
-新版明文登录态（v5.3.8+，主路径，Node 读取）与旧版 `state.vscdb`（回退路径，Electron 解密）均自动探测。
-
-| 平台 | 脚本 | 新版明文登录态（v5.3.8+，主路径） | 旧版 state.vscdb（回退） |
+| # | 检查 | 命令 | 通过标准 |
 |---|---|---|---|
+| 1 | 配置齐全 | `cat config.env` | `WB_ACCOUNT_UID` 非空 |
+| 2 | 本地签到 | `bash scripts/checkin.sh` | 出现「签到成功」或「今日已签到」 |
+| 3 | 快照落地 | `ls auth/` | 有 `<账号>.info`，且 `grep -c accessToken` = 1 |
+| 4 | Secret 已写 | `gh secret list --repo <owner/repo>` | 含 `WORKBUDDY_ACCESS_TOKEN` |
+| 5 | 云端可跑 | `gh run list --repo <owner/repo> --limit 1` | 最近一次 `success` |
+| 6 | 本地任务已装 | `schtasks /Query /TN WB-Refresh-<账号>` 或 `crontab -l` | 任务存在，`NextRunTime` 正确 |
+| 7 | 任务真能跑 | `schtasks /Run /TN WB-Refresh-<账号>` → 等 20s → 看 `logs/update_token.log` | 日志有新内容且无 401 |
+
+**第 7 项最容易被跳过，也最容易被骗**：`.cmd` 行尾是 LF 时，任务会显示成功、`LastTaskResult=0`、日志一条不生成。安装器已强制 CRLF 并做字节校验，但**必须实际跑一次看日志**。
+
+---
+
+# 日常运维
+
+```bash
+bash scripts/wb-detect.sh          # 一眼看全：能不能签、令牌还剩几天、云端最近状态
+bash scripts/checkin.sh            # 签到一次（幂等，随便跑）
+bash scripts/snapshot.sh           # 保鲜：搬最新令牌到 auth/<账号>.info
+bash scripts/push-secret.sh        # 回传：把令牌写到 GitHub Secret
+bash scripts/push-secret.sh --dry-run   # 只校验凭据可读，不推送
+```
+
+**令牌到期后（收到告警邮件时）的标准两步**：
+
+1. 桌面端用该账号**重新登录**（或完全退出后重启，触发新会话）——这是唯一能推后到期日的动作。
+2. `bash scripts/snapshot.sh && bash scripts/push-secret.sh`
+
+**改造任何脚本前先问一句**：「这个脚本除了签到，还在替谁做什么？」
+本项目最容易踩的坑是"只刷新本地快照、忘记推 Secret"——保鲜白做且无人察觉。
+
+# 核心认知（决定所有判断，别凭直觉）
+
+### 1. 保鲜 ≠ 续期，但"会不会续"取决于服务端签发方式
+
+| 观测到的情形 | 证据 | 行为 |
+|---|---|---|
+| 会话内滚动续签 | 10-24：桌面态 `iat` 比快照新 46.9 小时，`exp` 反而**早** 1.1 小时 | 刷新**不**后延 `exp` |
+| 重新建立会话 | 11-09：`iat` 前移 6 天，`exp` 同步前移 6 天（两者均 `iat + 30 天`） | 新会话给**满 30 天** |
+
+两种都实测到了，所以**不要往任何一端下结论**：
+
+- 不要向用户承诺"任务会自己续期"——存在不续期的那种情况。
+- 也不要笃定"到某天必然过期"——重新建立会话时到期日会前移。
+- **唯一可靠的判据是 `checkin-status` 的 HTTP 状态码**，不是 `exp`。
+- 保鲜任务的价值不变：确保云端持有的是**当前有效**令牌；如果桌面端恰好建立了新会话，顺带把到期日推后。
+- 正因为"可能不续期"，失败告警不能省。
+
+### 2. 新鲜度按 `iat` 判，不能按 `expiresAt`
+
+判据：当前登录态（文件名无时间戳）→ 令牌不同即覆盖；历史快照 → 仅当 `cand.iat > cur.iat` 才覆盖。
+
+用 `expiresAt` 比较会把**刚刷新的令牌**判为陈旧而拒收——因为滚动续签时新令牌的 `exp` 可能比旧令牌更早。
+（上面的证据表第二行是 `exp` 前移的情况，第一行是 `exp` 不变/更早的情况，两种都会遇到。）
+
+### 3. 幂等只认业务码 `code=10001`
+
+`checkin-status` 的 `today_checked_in` 字段实测不可靠（签完仍可能 `false`）。
+`daily-checkin` 在"今日已签到"时返回 **HTTP 400 + code=10001**，所以**不能把 HTTP≠200 当失败**，必须以响应体业务码为准。
+
+### 4. 网络异常 ≠ 令牌失效
+
+| 情况 | 含义 | 动作 |
+|---|---|---|
+| `HTTP 401/403` | 令牌真失效 | 跳过该候选，继续下一个 |
+| 连不上（超时/DNS/代理） | **无法判定** | 中止，明确报错，**不覆盖**现有快照 |
+
+把网络异常当 401，会把所有候选判死然后降级覆盖成更旧的令牌。
+**"测不出来"绝不能当成"可以用"。**
+
+### 5. 只有 `HTTP 200` 才算健康
+
+空输出、未知状态码、加密信封一律**不计为健康**。健康检查要三态退出码（0 全好 / 1 有失效 / 2 测不全），二值表达不了"测不出来"。
+
+### 6. 云端 cron 不是准点
+
+Actions 定时任务实测延迟 3~4 小时。它是"当天最后一道保险"，不是"凌晨准点补签"。
+
+# 本机配置项（config.env）
+
+| 键 | 含义 | 谁写 |
+|---|---|---|
+| `WB_ACCOUNT_NAME` | 展示名/任务名后缀 | `init-config.sh` |
+| `WB_ACCOUNT_UID` | 账号 uid，防串号锚点 | `init-config.sh` |
+| `WB_ACCOUNT_FILE` | `auth/<名>.info` 快照文件名 | `init-config.sh` |
+| `WB_APP_EXE` | 桌面端可执行文件（信封解密必需） | `init-config.sh` 探测 |
+| `WB_API_BASE` | 官方接口地址 | 默认 `https://copilot.tencent.com` |
+| `WB_SECRET_SUFFIX` | 多账号时 Secrets 后缀（`_2`） | 用户/`--force` |
+| `WB_CLOUD_REPO` | `owner/repo` | `cloud-init.sh` |
+| `WB_CLOUD_DIR` | 云端仓库本地目录 | `cloud-init.sh` |
+
+环境变量（临时覆盖，不写配置）：
+`WB_CHECKIN_AUTH_FILE`（指定登录态文件）、`WB_CHECKIN_APP_EXE`、`WB_NODE_BIN`、`WB_API_BASE`、`WB_AUTH_DIR`（测试用）、`WB_CHECKIN_JITTER=<秒>`（错峰）、`WB_DRY_RUN=1`（告警只打印不发送）。
+
+# 多账号
+
+桌面端是**单账号登录态**，切换会覆盖。多账号隔离靠两件事：
+
+1. 每个账号一份**规范化快照** `auth/<账号>.info`，脚本用 `WB_CHECKIN_AUTH_FILE` 指定。
+2. 每个账号一组 **Secret 后缀**（第二账号 `_2`），workflow 各引用各的。
+
+步骤：改 `config.env` 的 `WB_ACCOUNT_UID` / `WB_ACCOUNT_FILE` / `WB_SECRET_SUFFIX` → 跑 `snapshot.sh` → `push-secret.sh` → `cloud-init.sh --repo <第二仓库>`。
+**验证隔离**：两边的 `snapshot.sh` 输出里 uid 必须不同，云端两个 workflow 日志里 `WB_RESULT` 各自独立。
+
+# 排错
+
+- **`登录态为 $wbEncrypted 加密信封，但未找到 WorkBuddy 桌面端可执行文件`**：设 `WB_APP_EXE`。计划任务环境下 `WORKBUDDY_APP_PATH` 不继承，必须写进 `config.env` 或 `.cmd`（安装器已代劳）。
+- **交互式手跑成功，计划任务跑出来"来源=历史快照"**：同上，`WB_APP_EXE` 没传进任务环境。判定看日志里的来源标注，不是退出码。
+- **`schtasks /Run` 显示成功、`LastTaskResult=0`、日志一条没有**：`.cmd` 是 LF 行尾，cmd.exe 直接空跑。重跑 `local-task.ps1`（会强制 CRLF 并字节校验）。
+- **`.cmd` 日志中文乱码**：缺 `chcp 65001` 或 `PYTHONUTF8=1`，安装器已内置。
+- **`node -e` 报 `Illegal return statement`**：Node 22 不允许顶层 `return`，用 `if/else` 包裹。
+- **`read` 用 tab 作 `IFS` 导致行错位**：tab 是 IFS 空白字符，连续分隔符会被折叠。用 `\x1f`。
+- **`node` 读 `/g/...` 报 `ENOENT`**：node.exe 只认 `G:/...`。脚本内已统一 `cygpath -m`。
+- **`.sh` 被改成 CRLF 后比较/排序异常**：`\r` 混进变量值。`.gitattributes` 已固定 `.sh → LF`。
+- **云端到点没跑，晚了几小时**：Actions 排队延迟，不是配置错。看 `gh run list` 的 `created_at` 差值。
+- **告警说"已签到"却仍在报错**：`today_checked_in` 不可信，以 `daily-checkin` 的业务码为准。
+- **token `expiresAt` 还没到却 401**：服务端可能已提前作废（refreshToken 轮换等）。别只看 `expiresAt`，用 `checkin-status` 的 HTTP 状态码判。
+- **git push 报 `Connection was reset`**：先试直连，再试本地代理
+  `git -c http.proxy=http://127.0.0.1:7897 push`；两者都失败用 `gh api user` 区分"网络断了"还是"git 的 TLS 问题"。
+  另一种常见根因是 TLS 1.3 握手被中间链路破坏，可试 `git -c http.sslVersion=tlsv1.2 push`。
+
+# 安全红线
+
+- `accessToken` = 账号密码。**不进日志、不回显、不提交**。
+- 唯一落盘位置：`auth/<账号>.info`（已 `.gitignore`）。该目录不得同步到任何网盘/云盘。
+- 网络请求只发往 `copilot.tencent.com`。
+- `config.env`、`auth/`、`logs/`、`local/`、`cloud/` 全部被忽略，**不要 `git add -f`**。
+- 只用于用户自己的账号；不要实现批量注册/刷分。
+- 运行前如用户对"读取登录态"有疑虑，明确告知：**不读这个令牌就无法调用签到接口，这是签到的唯一实现路径**，且读取全程在本机、无上传。
+
+# 平台差异
+
+| 平台 | 签到脚本 | 新版明文登录态（v5.3.8+，主路径） | 旧版 `state.vscdb`（回退） |
+|---|---|---|---|
+| Windows | `checkin.sh`（Git Bash）或 `checkin.ps1` | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（回退 `%APPDATA%`） | `%APPDATA%\WorkBuddy\User\globalStorage\state.vscdb` |
 | macOS | `checkin.sh` | `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info` | `~/Library/Application Support/WorkBuddy/User/globalStorage/state.vscdb` |
-| Windows | `checkin.ps1`（或 Git Bash 跑 `checkin.sh`） | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（回退 `%APPDATA%`） | `%APPDATA%\WorkBuddy\User\globalStorage\state.vscdb` |
 | Linux | `checkin.sh` | `~/.config/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info` | `~/.config/WorkBuddy/User/globalStorage/state.vscdb` |
 
-Windows PowerShell 执行策略用 `-ExecutionPolicy Bypass`；需 `curl.exe`（Win10 1803+ 自带）。
-旧版 `state.vscdb` 分支在 Linux 需桌面会话 + 系统 keyring（GNOME Keyring / KWallet）；新版明文分支无此要求。
+旧版回退分支在 Linux 需要桌面会话 + 系统 keyring；新版明文分支无此要求。
 
-## 环境变量
+# 环境变量
+
+临时覆盖用，不写进 `config.env`：
 
 | 变量 | 作用 |
-|------|------|
-| `WB_CHECKIN_NODE=<path>` | 指定 Node 二进制路径（v5.3.8+ 主路径用，sh/ps1 通用） |
-| `WB_CHECKIN_ELECTRON=<path>` | 指定 Electron 二进制路径（仅旧版 state.vscdb 回退用，sh 版） |
-| `-ElectronPath <path>` | 同上（ps1 版参数） |
-| `WB_CHECKIN_APP_NAME=CodeBuddy` | 兼容旧版应用名（仅旧版 state.vscdb 分支的 macOS 钥匙串密钥） |
-| `WB_CHECKIN_JITTER=<秒>` | 启动前随机等待 0~N 秒，避免整点风暴 |
-| `WB_CHECKIN_AUTH_FILE=<path>` | **多账号隔离**：显式指定登录态 JSON 文件（如 <账号名> 的 `workbuddy-desktop.*.info` 快照），优先于默认探测路径。不设置时读当前桌面端登录态。decrypt-token.js / checkin.sh / sync_token.sh 均透传（v1.1.0+） |
+|---|---|
+| `WB_CHECKIN_AUTH_FILE` | 指定登录态文件（多账号隔离 / 指向规范化快照） |
+| `WB_CHECKIN_APP_EXE` | 桌面端可执行文件路径（`$wbEncrypted` 信封解密必需） |
+| `WB_NODE_BIN` | 指定 node 路径（缺 PATH 时用） |
+| `WB_API_BASE` | 接口地址，默认 `https://copilot.tencent.com` |
+| `WB_AUTH_DIR` | 覆盖登录态目录（仅测试/造故障样本用） |
+| `WB_CHECKIN_JITTER` | 启动前随机等待 0~N 秒，避免整点风暴 |
+| `WB_DRY_RUN=1` | 告警脚本只打印不发送 |
+| `WB_CHECKIN_NODE` / `WB_CHECKIN_ELECTRON` | 指定运行时（旧版回退分支用） |
 
-> **多账号隔离用法（Windows 实测落地 2026-08-19）**：WorkBuddy 桌面端是**单账号登录态**（`workbuddy-desktop.info` 只有一个账号），多账号并存时必须指定 `WB_CHECKIN_AUTH_FILE` 指向各账号的登录态快照文件。`auth` 目录下的快照文件为敏感凭据，务必加入 `.gitignore` 禁止提交。账号切换登录时桌面端会生成带时间戳的 `workbuddy-desktop.<ts>.<pid>.<uuid>.info` 快照，取 nickname 匹配目标的最近一份即可。
+# 权限与披露
 
-## 排错
-
-- **「获取令牌失败（未知原因）」/ 未找到本地登录态**：先确认 WorkBuddy 桌面端已登录并打开过至少一次。v5.3.8+ 用户检查 Node.js 是否安装（`node -v`），或用 `WB_CHECKIN_NODE` 指定。
-- **v5.3.8 已登录但仍报令牌失败**：本机 skill 版本过旧（< 1.0.2），不识别新版明文存储；升级到 1.0.2+。
-- **当日重跑提示「签到未成功 / code=10001」**：旧版本（< 1.0.2）未把 `code=10001` 识别为「已签到」；1.0.2+ 会正确报告「今日已签到」。
-- **401 令牌过期**：打开 WorkBuddy 刷新登录态，脚本每次运行会重新读取最新 token，次日自动恢复。
-- **偶发「令牌已过期（401）」但次日又正常（< 1.0.3）**：401 判定原为扫响应体子串，响应体里的随机 `requestId` 恰好含 `401` 时会误判（约 0.57%/次），当日签到被跳过且连续签到中断。1.0.3 起改用真实 HTTP 状态码判定。
-- **Windows 已登录却持续 401（< 1.0.3）**：1.0.2 的 win32 候选只探 `%APPDATA%`，而桌面端实际把明文登录态写在 `%LOCALAPPDATA%`；读不到新文件时会回退旧版 `state.vscdb`，取到**过期的历史会话令牌**，表现为「能拿到 token 但接口 401」。1.0.3 起优先探 `%LOCALAPPDATA%`。**排查 401 请先确认令牌来源，而非怀疑请求路径或请求头**（实测网关不强制 `/v2/` 与 `X-User-Id`，见 CHANGELOG 1.0.3）。
-- **macOS 解密报错但已登录（旧版账户）**：旧版迁移应用名仍是 `CodeBuddy`，设 `export WB_CHECKIN_APP_NAME=CodeBuddy` 后重试（仅走 state.vscdb 分支时生效）。
-- **Electron 下载慢/失败（旧版账户）**：配置 npm 镜像（见 `references/dependencies.md`）后重跑 setup；或手动放置 Electron 后用环境变量/参数指定。v5.3.8+ 新版账户无需 Electron。
-- **Windows 提示不是内部或外部命令**：用 `powershell -ExecutionPolicy Bypass -File …` 运行；确认 `curl.exe` 存在。
-- **沙箱里 `require('electron')` 报错**：Agent 沙箱默认设 `ELECTRON_RUN_AS_NODE=1`，脚本已用 `env -u`（sh）/ `Remove-Item Env:`（ps1）处理；v5.3.8+ 主路径用纯 Node，不受此影响。
-- **任务计划触发后 `logs/daily.log` 无新内容**：先 `schtasks /Query /TN <任务名> /V` 看「上次结果」——非 0 说明 .cmd 本身没跑起来（路径/权限问题）；再确认 .cmd 里 `HOME`、`PATH`（NODE/PY/GH）是否配置完整（任务计划环境是精简 PATH）。
-- **.cmd 日志中文乱码**：cmd 默认 GBK 代码页，bash 输出 UTF-8。.cmd 开头加 `chcp 65001 >nul`，并设 `PYTHONUTF8=1`（否则 python 输出 GBK 与 echo 的 UTF-8 混排）。修复后重跑任务（不要只看旧日志）。
-- **git push 失败（`Connection was reset` / `Failed to connect to github.com:443`）**：本机 GitHub 走代理 `http://<代理地址>`（具体工具视本机环境而定），gh CLI 自动走代理但 `git push` 不继承。用 `git -c http.proxy=http://<代理地址> push origin main`，或 `git config --global http.proxy http://<代理地址>`。
-- **快照 token 的 expiresAt 显示未到期却仍 401（服务端作废，非切换撤销）**：快照 JSON 里的 `expiresAt`（如 60 天后）是签发时写的，不代表服务端仍认可。**实测（2026-08-21）：「切换桌面端登录账号」不会立即撤销旧账号的 accessToken**——连续 3 次切换登录（<账号名>→<账号名>→<账号名>）后，被切走的<账号名> accessToken 调 checkin-status 仍返回 200。401 更可能是服务端对 refreshToken/会话的作废（如桌面端自动刷新轮换 refreshToken 后旧链失效），具体触发尚不明确。表现：`auth/<账号>.info` 日期很近、expiresAt 尚远，但本地与云端连续 401；且本地 `checkin.sh && sync_token.sh` 因签到失败短路，云端 Secrets 一直持有坏 token。**排查**：先跑仓库内 `check_health.sh` 快速定位哪个账号失效；再看桌面端 auth 目录（`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\`）里该账号是否有更新快照。**修复链路**：在桌面端重新登录该账号（产生新登录态）→ `bash sync_snapshots.sh` 刷新仓库快照 → 跑该账号 `daily_checkin.cmd`（签到 + 回传 Secrets）→ 云端 `workflow_dispatch` 验证一次。注意：`sync_snapshots.sh` 按 nickname 取 mtime 最新快照，当前登录态（`workbuddy-desktop.info`）也会被扫描，无需手动复制。
-- **多账号串号（任务名带 A 账号却签了 B 账号）**：桌面端单账号登录态被切换覆盖后，旧任务的 `sync_token.sh` 会把**当前登录账号**（B）的 token 回传到 A 的无后缀 Secret，导致云端 A 的 workflow 实际用 B 的凭据签到。**排查方法**：比对各账号 `workbuddy-desktop.*.info` 的 `account.nickname` / `account.uid` 与 Secrets 更新时间线；根治 = 每个账号固定 `WB_CHECKIN_AUTH_FILE` 快照 + 独立后缀 Secrets。
-- **node 读取 /g/... POSIX 路径报 `ENOENT`（拼成 `g:\g\...`）**：Windows Git Bash 里 node.exe 只认 Windows 风格路径。脚本内用 `cygpath -m` 转换（`G:/...`）；不要直接传 `/g/...`。同理 `fs.readFileSync` 读仓库内快照时用 `<你的开发目录>/...` 而非 `<你的开发目录>/...`。
-- **`require('...info')` 报 MODULE_NOT_FOUND**：`.info` 不是 JS 可加载扩展名，读取快照必须用 `fs.readFileSync(path,'utf8')` + `JSON.parse`，不能 `require`。
-- **浏览器 Cookies 文件被占用（`WinError 32` / `Device or resource busy`）**：Chrome/Edge 运行时 Cookies 数据库被锁，`cp` 复制会失败。只读探测可用 `sqlite3` URI `file:...?mode=ro&immutable=1`（Chrome 可行）；但既然 cookie 是 v20 App-Bound 加密，解密不可行，**直接放弃 cookie 路线，改用桌面端快照**。
-- **`schtasks /query` 输出乱码/二进制**：Git Bash 下 schtasks 输出 UTF-16，grep 会报 `Binary file matches`。用 `PowerShell` 的 `Get-ScheduledTask` / `Get-ScheduledTaskInfo` 查询，或 `iconv -f UTF-16LE -t UTF-8` 转换后再 grep。
-
-## 安全说明
-
-> ⚠️ **凭据即账号密码**：本 skill 解密的 `accessToken` 等同你的 WorkBuddy 账号密码，具有高敏感性。请务必遵守以下红线：
-
-- 令牌仅在内存中使用，通过管道立即被签到请求消费，**不写入任何日志文件、不落盘、不回显到终端、不提交到仓库**。
-- `logs/` 仅记录签到结果（积分 / 连续天数 / 成功失败），**绝不含令牌原文**。切勿将日志或脚本输出粘贴分享。
-- 网络访问仅发往腾讯官方接口 `copilot.tencent.com/billing/meter/*` 与 `copilot.tencent.com/v2/billing/meter/*`，不上传任何第三方。
-- 解密成功时脚本会向 stderr 打印一行安全提示（不影响 stdout 的 token 管道），便于你确认凭据正在被使用。
-- 请勿用于他人账户、批量注册刷分或任何违反 WorkBuddy 用户协议的用途；使用者自行承担使用风险。
-
-### 为何需要这些能力（上下文说明）
-
-本 skill 自述为"每日签到"，但完整链路需以下能力，均为本机运行、无后端，且对完成签到必不可少：
-
-- **读取本地令牌**：WorkBuddy 桌面端登录后把登录态存于本地——v5.3.8+ 为明文 JSON 文件（`workbuddy-desktop.info`，纯 Node 可读），旧版为 Electron `safeStorage` 加密的 `state.vscdb`。必须读到 `accessToken` 才能调用官方签到接口，这是签到功能的核心，无法绕过。
-- **Node.js 运行时**：v5.3.8+ 主路径用 Node 直接读取明文登录态并解析 JSON。推荐手动指定已校验的 Node（设 `WB_CHECKIN_NODE`）。
-- **Electron 运行时（仅旧版账户）**：只有使用旧版 WorkBuddy/CodeBuddy（`state.vscdb`）时才需要，执行 `safeStorage.decryptString()` 解密令牌（macOS 命中钥匙串、Windows/Linux 走系统 DPAPI/keyring）。推荐手动指定已校验的 Electron（设 `WB_CHECKIN_ELECTRON`），不依赖自动下载。
-- **python3 回退（默认关闭）**：仅当旧版分支的 `node:sqlite` 不可用时，设 `WB_CHECKIN_ALLOW_PY_FALLBACK=1` 才会调用外部 `python3` 读取会话库。默认关闭以缩小信任边界。
-- **定时任务（crontab / launchd / 任务计划程序）**：用于多时间点幂等补签，脚本本身不写入系统定时，需你显式配置。
-
-### 供应链提示
-
-安装 Electron 默认**不自动下载**（避免静默引入第三方大二进制）。如需自动安装，须显式设置环境变量 `WB_CHECKIN_AUTO_INSTALL_ELECTRON=1` 确认从官方 npm registry 下载 `electron@37`。
-
-## 所需权限
-
-本 skill 运行需以下本地权限，均限定在最小范围：
+本 skill 运行所需的本地权限，均限定在最小范围：
 
 | 权限 | 范围 | 说明 |
-|------|------|------|
-| 本地代码执行 | 仅本 skill 的 `checkin.sh/.ps1`、`decrypt-token.js`、`setup.sh/.ps1` | 用户手动或定时触发，非后台常驻 |
-| 本地文件读取 | 用户目录下的 WorkBuddy 登录态（v5.3.8+ 明文 `workbuddy-desktop.info` / 旧版 `state.vscdb`） | 读取登录态以获取调用官方接口所需的 accessToken |
-| 网络访问 | 仅 `copilot.tencent.com` 官方签到接口 | 不访问任何其他域名 |
-| 环境变量读取 | `WB_CHECKIN_*`（Node/Electron 路径、应用名、错峰、回退开关） | 均为本机用户显式配置 |
-| 定时任务 | 由用户显式配置 crontab / launchd / 任务计划程序 | skill 不自动写入系统定时 |
+|---|---|---|
+| 本地代码执行 | 仅本仓库 `scripts/` 下的脚本 | 手动或定时触发，非常驻后台 |
+| 本地文件读取 | 用户目录下的 WorkBuddy 登录态文件 | 只读；唯一写入是 `auth/<账号>.info`（已 gitignore） |
+| 网络访问 | 仅 `copilot.tencent.com` 官方接口；云端部分访问 `api.github.com` | 不访问任何其他域名 |
+| Secrets 写入 | 用户自己指定的 GitHub 仓库 | 经 `gh secret set`，token 走 stdin，不进命令行历史 |
+| 定时任务 | 由安装器显式注册，可一条命令卸载 | 不偷装、不隐藏 |
+
+### 为什么必须读登录令牌
+
+WorkBuddy 桌面端登录后把登录态存放在本地，签到接口要求 `Authorization: Bearer <accessToken>`。
+**不读这个令牌就无法调用签到接口——这是签到的唯一实现路径，没有替代方案。**
+读取全程在本机完成，不上传任何第三方；脚本会把这一点打印在 stderr 便于随时确认。
+
+### 供应链
+
+- 旧版账户才需要 Electron，且**默认不自动下载**。需要时须显式设置 `WB_CHECKIN_AUTO_INSTALL_ELECTRON=1`，从官方 npm registry 拉取 `electron@37`（约 100MB）。
+- 新版账户（v5.3.8+）**完全不需要 Electron**，纯 Node 即可。
+- 本仓库不包含任何混淆代码、不引入第三方 pip/npm 依赖，云端只依赖 Python 标准库。
+
+# 卸载
+
+```bash
+# 1. 删定时任务
+powershell -ExecutionPolicy Bypass -File scripts\local-task.ps1 -Remove   # Windows
+bash scripts/local-cron.sh --remove                                       # macOS/Linux
+
+# 2. 删云端（可选）
+gh repo delete <owner/repo> --yes
+
+# 3. 删 skill
+rm -rf "$HOME/.workbuddy/skills/workbuddy-checkin"
+```

@@ -121,7 +121,8 @@ if [[ "$TOKEN" == ERR* ]]; then
   exit 1
 fi
 
-API="https://copilot.tencent.com"
+API="${WB_API_BASE:-https://copilot.tencent.com}"
+API="${API%/}"
 
 # ---------- 2. 查询签到状态 ----------
 # 鉴权失败一律以真实 HTTP 状态码判定，不再匹配响应体子串。

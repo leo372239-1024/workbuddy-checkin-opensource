@@ -1,0 +1,218 @@
+﻿# ============================================================
+# 本地定时任务安装器（Windows 任务计划程序）
+#
+# 做什么：
+#   1) 生成 <repo>\local\update_token.cmd  —— 保鲜 + 幂等签到 + 回传 Secret
+#   2) 生成 <repo>\local\daily_checkin.cmd —— 只签到（可选）
+#   3) 注册计划任务并开启「错过定点则开机补跑」
+#
+# 为什么不能手写 .cmd 就完事（三条硬约束，都是实测踩出来的）：
+#   - 行尾必须是 CRLF。LF 的 .cmd 会被 cmd.exe 静默空跑：任务显示成功、
+#     LastTaskResult=0、日志一条不生成——看起来一切正常。本脚本强制 CRLF。
+#   - 任务计划环境的 PATH 是精简系统 PATH，不含 node/python/gh，且没有 HOME。
+#     必须在 .cmd 里显式 set，否则脚本跑不起来。
+#   - 任务计划不继承用户会话的 WORKBUDDY_APP_PATH，信封解密会静默退化为
+#     「翻历史明文快照」。必须显式 set WB_CHECKIN_APP_EXE。
+#
+# 用法（PowerShell）：
+#   powershell -ExecutionPolicy Bypass -File scripts\local-task.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\local-task.ps1 -Mode daily
+#   powershell -ExecutionPolicy Bypass -File scripts\local-task.ps1 -Mode both -Days 10 -At 12:00
+#   powershell -ExecutionPolicy Bypass -File scripts\local-task.ps1 -Remove
+# ============================================================
+param(
+  [ValidateSet("refresh", "daily", "both")]
+  [string]$Mode = "refresh",
+  [int]$Days = 10,
+  [string]$At = "12:00",
+  [switch]$Remove,
+  [switch]$WhatIfOnly
+)
+
+$ErrorActionPreference = "Stop"
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$LocalDir = Join-Path $RepoRoot "local"
+$LogDir   = Join-Path $RepoRoot "logs"
+
+function Read-Config {
+  $cfg = @{}
+  $p = Join-Path $RepoRoot "config.env"
+  if (Test-Path $p) {
+    Get-Content $p -Encoding UTF8 | ForEach-Object {
+      if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') { $cfg[$matches[1]] = $matches[2].Trim() }
+    }
+  }
+  return $cfg
+}
+
+function Find-Exe([string[]]$Globs) {
+  foreach ($g in $Globs) {
+    $hit = Get-Item $g -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($hit) { return $hit.FullName }
+  }
+  return ""
+}
+
+function Get-DirOf([string]$Exe) {
+  if ([string]::IsNullOrEmpty($Exe)) { return "" }
+  return (Split-Path -Parent $Exe)
+}
+
+function To-Posix([string]$WinPath) {
+  $p = $WinPath -replace '\\', '/'
+  if ($p -match '^([A-Za-z]):(.*)$') { return "/" + $matches[1].ToLower() + $matches[2] }
+  return $p
+}
+
+$cfg = Read-Config
+$AccountName = $cfg["WB_ACCOUNT_NAME"]
+if ([string]::IsNullOrEmpty($AccountName)) { $AccountName = "account" }
+$Slug = ($AccountName -replace '[^A-Za-z0-9._-]', '_')
+$AuthFile = $cfg["WB_ACCOUNT_FILE"]
+$AppExe = $cfg["WB_APP_EXE"]
+if ([string]::IsNullOrEmpty($AppExe)) {
+  $cache = Join-Path $RepoRoot "auth\.app_exe"
+  if (Test-Path $cache) { $AppExe = (Get-Content $cache -Raw -Encoding UTF8).Trim() }
+}
+
+$TaskRefresh = "WB-Refresh-$Slug"
+$TaskDaily1  = "WB-Daily-$Slug-11"
+$TaskDaily2  = "WB-Daily-$Slug-21"
+
+# ---------- -Remove ----------
+if ($Remove) {
+  foreach ($n in @($TaskRefresh, $TaskDaily1, $TaskDaily2)) {
+    $t = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
+    if ($t) { Unregister-ScheduledTask -TaskName $n -Confirm:$false; "已删除任务：$n" }
+    else { "未找到任务：$n" }
+  }
+  exit 0
+}
+
+# ---------- 运行时探测 ----------
+$Bash = "C:\Program Files\Git\bin\bash.exe"
+if (-not (Test-Path $Bash)) {
+  $alt = Find-Exe @("C:\Program Files (x86)\Git\bin\bash.exe", "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe")
+  if ($alt) { $Bash = $alt }
+}
+if (-not (Test-Path $Bash)) { throw "未找到 Git Bash（$Bash）。请安装 Git for Windows。" }
+
+$NodeBin = Find-Exe @(
+  "$env:USERPROFILE\.workbuddy\binaries\node\versions\*\node.exe",
+  "$env:USERPROFILE\.workbuddy-ai\binaries\node\versions\*\node.exe",
+  "C:\Program Files\nodejs\node.exe"
+)
+if (-not $NodeBin) { $c = Get-Command node -ErrorAction SilentlyContinue; if ($c) { $NodeBin = $c.Source } }
+if (-not $NodeBin) { throw "未找到 node.exe。请安装 Node.js 20+。" }
+
+$PyBin = Find-Exe @(
+  "$env:USERPROFILE\.workbuddy\binaries\python\versions\*\python.exe",
+  "$env:USERPROFILE\.workbuddy-ai\binaries\python\versions\*\python.exe"
+)
+if (-not $PyBin) { $c = Get-Command python -ErrorAction SilentlyContinue; if ($c) { $PyBin = $c.Source } }
+
+$GhBin = Find-Exe @(
+  "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\GitHub.cli_Microsoft.Winget.Source_8wekyb3d8bbwe\bin\gh.exe",
+  "C:\Program Files\GitHub CLI\gh.exe"
+)
+if (-not $GhBin) { $c = Get-Command gh -ErrorAction SilentlyContinue; if ($c) { $GhBin = $c.Source } }
+
+$NodeDir = Get-DirOf $NodeBin
+$PyDir   = Get-DirOf $PyBin
+$GhDir   = Get-DirOf $GhBin
+$UserHome = $env:USERPROFILE
+$WinRepo  = $RepoRoot   # cmd 内一律反斜杠：正斜杠在 mkdir / 重定向里不可靠
+$PosixRepo = To-Posix $RepoRoot
+
+Write-Host "仓库      : $RepoRoot"
+Write-Host "账号      : $AccountName (slug=$Slug)"
+Write-Host "bash      : $Bash"
+Write-Host "node      : $NodeBin"
+Write-Host "python    : $PyBin"
+Write-Host "gh        : $GhBin"
+Write-Host "AUTH_FILE : $AuthFile"
+Write-Host "APP_EXE   : $AppExe"
+
+# ---------- 生成 .cmd（强制 CRLF + UTF8 无 BOM） ----------
+function New-Cmd([string]$Path, [string]$Body) {
+  $lines = @(
+    "@echo off",
+    "chcp 65001 >nul",
+    "setlocal",
+    "REM AUTO-GENERATED by scripts/local-task.ps1 - do not edit, re-run the installer",
+    "set `"HOME=$UserHome`"",
+    "set `"PATH=$NodeDir;$PyDir;$GhDir;%PATH%`"",
+    "set `"PYTHONUTF8=1`""
+  )
+  if ($AuthFile) {
+    $lines += "set `"WB_CHECKIN_AUTH_FILE=$WinRepo/auth/$AuthFile`""
+  }
+  if ($AppExe) {
+    $lines += "set `"WB_CHECKIN_APP_EXE=$AppExe`""
+  }
+  $lines += "if not exist `"$WinRepo\logs`" mkdir `"$WinRepo\logs`""
+  $lines += $Body
+  $lines += "endlocal"
+  $text = ($lines -join "`r`n") + "`r`n"
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, $text, $enc)
+}
+
+if (-not (Test-Path $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
+if (-not (Test-Path $LogDir))   { New-Item -ItemType Directory -Path $LogDir   -Force | Out-Null }
+
+$refreshCmd = Join-Path $LocalDir "update_token.cmd"
+$dailyCmd   = Join-Path $LocalDir "daily_checkin.cmd"
+
+New-Cmd $refreshCmd "`"$Bash`" -lc `"cd '$PosixRepo' && bash scripts/snapshot.sh; bash scripts/checkin.sh && bash scripts/push-secret.sh`" >> `"$WinRepo\logs\update_token.log`" 2>&1"
+New-Cmd $dailyCmd   "`"$Bash`" -lc `"cd '$PosixRepo' && bash scripts/checkin.sh`" >> `"$WinRepo\logs\daily.log`" 2>&1"
+
+# 字节级复核 CRLF（这是最容易静默失效的一项，必须验）
+foreach ($f in @($refreshCmd, $dailyCmd)) {
+  $bytes = [System.IO.File]::ReadAllBytes($f)
+  $crlf = 0; for ($i = 1; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -eq 10 -and $bytes[$i-1] -eq 13) { $crlf++ } }
+  $lf = 0; foreach ($b in $bytes) { if ($b -eq 10) { $lf++ } }
+  if ($crlf -ne $lf) { throw "行尾校验失败：$f (CRLF=$crlf LF=$lf)" }
+  Write-Host "已生成 $(Split-Path -Leaf $f)（CRLF 校验通过，$lf 行）"
+}
+
+if ($WhatIfOnly) { Write-Host "（-WhatIfOnly）未注册计划任务。"; exit 0 }
+
+# ---------- 注册计划任务 ----------
+function New-WbTask([string]$Name, [string]$CmdPath, $Trigger, [string]$Desc) {
+  $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$CmdPath`""
+  $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+              -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+  $settings.DisallowStartIfOnBatteries = $false
+  $existing = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+  if ($existing) { Unregister-ScheduledTask -TaskName $Name -Confirm:$false }
+  Register-ScheduledTask -TaskName $Name -Action $action -Trigger $Trigger -Settings $settings -Description $Desc | Out-Null
+  $t = Get-ScheduledTask -TaskName $Name
+  $info = Get-ScheduledTaskInfo -TaskName $Name
+  Write-Host ("已注册 {0}  下次运行 {1}" -f $Name, $info.NextRunTime)
+}
+
+$timeParts = $At.Split(":")
+$hh = [int]$timeParts[0]; $mm = [int]$timeParts[1]
+
+if ($Mode -eq "refresh" -or $Mode -eq "both") {
+  $trg = New-ScheduledTaskTrigger -Daily -DaysInterval $Days -At (Get-Date -Hour $hh -Minute $mm -Second 0)
+  New-WbTask -Name $TaskRefresh -CmdPath $refreshCmd -Trigger $trg `
+    -Desc "WorkBuddy 令牌保鲜 + 幂等签到 + 回传 Secret（每 $Days 天）"
+}
+
+if ($Mode -eq "daily" -or $Mode -eq "both") {
+  New-WbTask -Name $TaskDaily1 -CmdPath $dailyCmd `
+    -Trigger (New-ScheduledTaskTrigger -Daily -At (Get-Date -Hour 11 -Minute 0 -Second 0)) `
+    -Desc "WorkBuddy 本地补签 11:00（幂等）"
+  New-WbTask -Name $TaskDaily2 -CmdPath $dailyCmd `
+    -Trigger (New-ScheduledTaskTrigger -Daily -At (Get-Date -Hour 21 -Minute 0 -Second 0)) `
+    -Desc "WorkBuddy 本地补签 21:00（幂等）"
+}
+
+Write-Host ""
+Write-Host "验证方式（不要只看退出码）："
+Write-Host "  1. schtasks /Run /TN <任务名>"
+Write-Host "  2. 等 15~30 秒"
+Write-Host "  3. 看日志：$LogDir"
+Write-Host "注意：LastTaskResult=0 只代表 cmd.exe 正常退出，不代表签到成功。"

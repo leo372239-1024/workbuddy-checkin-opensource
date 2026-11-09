@@ -1,5 +1,35 @@
 # 变更日志
 
+## [2.0.0] - 2026-11-09
+
+### 重构：从「单机脚本」到「可分发部署包」
+
+上一版是作者本机环境的说明书，别人拿到后要自己改路径、改 uid、猜账号。本版把「机器相关」与「逻辑」彻底分离。
+
+### 新增
+
+- **`scripts/wb-config.sh`**：配置读写库。所有机器相关值收敛到 `config.env`（已 gitignore），代码里不再出现任何 uid / 绝对路径 / 仓库名。
+- **`scripts/wb-detect.sh`**：只读环境体检，输出人类可读报告 + `DETECT:KEY=VALUE` 机器行，退出码三态（0 可用 / 1 有告警 / 2 有硬阻塞）。Agent 据此决定下一步，而不是靠猜。
+- **`scripts/init-config.sh`**：消费体检结果生成 `config.env`，与体检共用同一份判断，避免两套逻辑漂移。
+- **`scripts/cloud-init.sh`**：一条命令在**用户自己的 GitHub 账号**下建私有仓库、渲染 workflow、写 Secrets、可选立即验证；带 `--dry-run` 只渲染不落地。
+- **`scripts/local-task.ps1`**：生成 `.cmd` 并注册计划任务。强制 CRLF 并做字节级校验（LF 的 `.cmd` 会被 cmd.exe 静默空跑：任务显示成功、`LastTaskResult=0`、日志一条不生成）；自动注入 `HOME` / `PATH`（node/python/gh）/ `PYTHONUTF8` / `WB_CHECKIN_APP_EXE`——计划任务环境这四项全都缺。
+- **`scripts/local-cron.sh`**：macOS/Linux crontab，用标记注释增删条目，不碰用户其它定时任务。
+- **`scripts/snapshot.sh`、`scripts/push-secret.sh`**：由私有版泛化，保留原有选源纪律（当前登录态优先、按 `iat` 判新鲜、解出 uid 交叉校验防串号、网络异常不覆盖快照）。
+- **`templates/cloud/`**：云端三件套（`checkin.py` / `notify.py` / `checkin.yml`），邮件告警通道去掉了个人邮箱默认值，未配置时自动降级为 GitHub Issue。
+
+### 修正
+
+- **账号歧义不再自动猜**：桌面端可能同时存在 `workbuddy-desktop.info` 与 `workbuddy-desktop-ai.info` 两份「当前登录态」且分属不同账号。旧逻辑取第一个命中的文件，会把 A 账号的令牌写进 B 账号的任务——表现为「签到一直成功，但积分进的是另一个号」。现在检测到多 uid 即拒绝自动选择，要求 `--uid` 显式指定。
+- **桌面端可执行文件探测**：新增 `WORKBUDDY_APP_PATH` 反推与盘符根目录 `*workbuddy*` 兜底，修复「客户端装在非标准目录 → 信封解密失败 → 悄悄退化为搬历史明文快照」。
+- **按实测修正令牌有效期认知**：旧版断言「滚动刷新只前移 `iat`、绝不后延 `exp`，硬到期只能靠重新登录」。2026-11-09 复测推翻：11-03 的令牌 `exp=12-03`，11-09 桌面端新令牌 `exp=12-09`，两者跨度均为整 30 天，说明重建会话时会给出完整新窗口。现表述为「两种都实测到过，不要往任何一端下结论」，并明确判有效性只认 `checkin-status` 的 HTTP 状态码。
+- **Windows 脚本编码**：`.ps1` 改为 UTF-8 with BOM。PS 5.1 会把无 BOM 的 UTF-8 当 GBK 解析，中文注释直接导致语法崩溃。
+- **`.gitignore` 目录锚定**：原 `cloud/` 规则会连 `templates/cloud/` 一起忽略，导致云端模板没能进版本库。
+
+### 文档
+
+- `SKILL.md` 重写为「首次部署协议」（六阶段 + 门禁）+「日常运维」+「核心认知」，每条纪律都标注了对应的事故形态。
+- 新增 `references/dependencies.md` 引用；README 面向人类，给出「一句话安装」与手动路径。
+
 ## [1.3.0] - 2026-08-19
 
 ### 新增

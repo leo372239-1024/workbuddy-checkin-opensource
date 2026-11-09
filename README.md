@@ -1,125 +1,75 @@
-# WorkBuddy 每日积分签到
+# WorkBuddy 自动签到（开源版）
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
+每天自动领取 WorkBuddy 每日积分（100 积分/天，连续第 7 天 1000 积分）。
+**全流程在本机与你自己 GitHub 私有仓库内完成，没有第三方服务器，凭据不离开你。**
 
-自动领取 **WorkBuddy** 每日积分（**100 积分/天，连续第 7 天 1000 积分**）的本地签到脚本。全流程在本机完成：读取本地登录态 → 调用腾讯官方签到接口，**无任何后端服务**。
+> 这是一个 [Agent Skill](https://www.workbuddy.cn/docs/workbuddy/Overview)。它不是给你手敲命令的，而是让**你的桌面 Agent** 读完 `SKILL.md` 后，一步步引导你完成部署。
 
-> 本仓库是 [workbuddy-checkin](https://github.com/leo372239-1024/workbuddy-checkin-opensource) WorkBuddy 技能的开源版本，已移除所有个人身份信息，可直接分发使用。
+## 一句话安装
 
-## ✨ 特性
-
-- **纯本机运行**：令牌仅在内存中使用，不落盘、不回显、不写日志
-- **新版明文登录态直读**：WorkBuddy v5.3.8+ 用 Node 直接读明文 `workbuddy-desktop.info`，**无需 Electron**
-- **旧版回退**：旧版 `state.vscdb`（Electron `safeStorage` 加密）自动回退
-- **多账号彻底隔离**：登录态快照 + `WB_CHECKIN_AUTH_FILE` 指定 + Secrets 后缀隔离
-- **幂等设计**：一天多时间点补签无副作用，随机错峰避免整点风暴
-
-## 🔍 原理
-
-1. WorkBuddy 桌面端登录后本地保存登录态。**v5.3.8+ 新版**为明文 JSON 文件：
-   - macOS：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
-   - Windows：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
-   - 结构 `{ account, auth: { accessToken, refreshToken, expiresAt, ... } }`
-2. **旧版** WorkBuddy/CodeBuddy 用 Electron `safeStorage` 加密存于 `state.vscdb`，新版文件缺失时回退到此路径解密。
-3. 调用腾讯官方签到 API：
-   - 查状态：`POST https://copilot.tencent.com/v2/billing/meter/checkin-status`
-   - 执行签到：`POST https://copilot.tencent.com/v2/billing/meter/daily-checkin`
-   - 认证：`Authorization: Bearer <accessToken>` + `X-User-Id: <account.uid>`
-
-## 📁 目录结构
+把下面这句话发给你自己的桌面 Agent（WorkBuddy / CodeBuddy 等支持 Skill 的客户端）：
 
 ```
-workbuddy-checkin-opensource/
-├── SKILL.md                    # WorkBuddy 技能说明（含完整踩坑经验）
-├── CHANGELOG.md                # 变更日志
-├── references/
-│   └── dependencies.md         # 依赖清单与平台差异
-└── scripts/
-    ├── decrypt-token.js        # 解密令牌（跨平台）
-    ├── checkin.sh              # macOS / Linux / Git Bash
-    ├── checkin.ps1             # Windows PowerShell
-    ├── setup.sh                # macOS / Linux 一键安装
-    └── setup.ps1               # Windows 一键安装
+根据链接安装并运行这个 skill：https://github.com/leo372239-1024/workbuddy-checkin-opensource
 ```
 
-## 🚀 快速开始
+Agent 会依次做：克隆到 skills 目录 → 环境体检 → 生成本机配置 → 跑通一次签到 → （可选）创建你的私有云端仓库 → 装好本地定时任务。
+每个阶段都会先告诉你要做什么、再执行，遇到阻塞会停下来问，不会自己乱猜。
 
-macOS / Linux：
-```bash
-bash scripts/setup.sh     # 检测运行时并验证令牌链路
-bash scripts/checkin.sh   # 立即签到一次（验证）
+## 它解决什么问题
+
+| 场景 | 没有它 | 有它 |
+|---|---|---|
+| 每天手动开客户端签到 | 忘一天就断连续 | 定时任务幂等执行，重复跑无副作用 |
+| 电脑关机 | 当天漏签 | 云端 GitHub Actions 兜底（延迟 3~4 小时，属正常） |
+| token 过期 | 静默失效，连续签到中断 | 失败即告警邮件 + GitHub Issue 双通道 |
+| 多账号 | 相互覆盖、串号 | 每个账号独立快照 + 独立 Secret 后缀 |
+
+## 架构
+
+```
+桌面端登录态 ──► 快照保鲜 ──► auth/<账号>.info ──► 幂等签到（本地）
+   ($wbEncrypted)   (按 iat 选源)        │
+                                        └──► GitHub Secrets ──► Actions 每日签到（云端）
+                                                                    └─失败─► 邮件 / Issue
 ```
 
-Windows（PowerShell）：
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-powershell -ExecutionPolicy Bypass -File scripts\checkin.ps1
-```
+两条通道互相独立：本地负责「拿到最新令牌并回传」，云端负责「即使你关机也能签」。
 
-前置条件：本机已安装并**登录** WorkBuddy 桌面端；系统已安装 Node.js（v5.3.8+ 主路径）。
+## 环境要求
 
-## 📦 依赖
+- WorkBuddy 桌面端，且**已登录至少一次**
+- Node.js 20+（读取登录态、解析 JWT）
+- Windows 10+ / macOS 12+ / Linux
+- 可选：`gh` CLI（配置云端任务）、Python 3（签到结果明细解析）
 
-| 依赖 | 用途 | 说明 |
-|------|------|------|
-| WorkBuddy 桌面端（已登录） | 提供本地登录态 | v5.3.8+ 明文 / 旧版 `state.vscdb` |
-| Node.js（20+） | 读取新版明文登录态 | v5.3.8+ 主路径必需 |
-| curl | 调用签到 API | macOS/Linux 自带；Windows 10 1803+ 自带 |
-| Electron 运行时 | **仅旧版** `state.vscdb` 解密 | 仅旧版账户需要 |
-
-> v5.3.8+ 用户：装好 Node.js 并登录桌面端即可直接签到，**无需 Electron**。
-
-## ⏰ 定时任务
-
-### Windows（任务计划程序）
-
-```powershell
-schtasks /Create /TN "WB-DailyCheckin-11" /TR "<你的项目路径>\daily_checkin.cmd" /SC DAILY /ST 11:00 /F
-schtasks /Create /TN "WB-DailyCheckin-21" /TR "<你的项目路径>\daily_checkin.cmd" /SC DAILY /ST 21:00 /F
-```
-
-> 建议用 `.cmd` 入口脚本（内含 `HOME`/`PATH`/`PYTHONUTF8`/`chcp 65001` 等配置）。
-
-### macOS / Linux（crontab）
+## 手动使用（不想用 Agent 时）
 
 ```bash
-0 9,12,15,18,21 * * * /path/to/scripts/checkin.sh >> /path/to/logs/checkin.log 2>&1
+git clone https://github.com/leo372239-1024/workbuddy-checkin-opensource ~/.workbuddy/skills/workbuddy-checkin
+cd ~/.workbuddy/skills/workbuddy-checkin
+
+bash scripts/wb-detect.sh        # 体检：能不能签、令牌还剩几天
+bash scripts/init-config.sh      # 写 config.env
+bash scripts/checkin.sh          # 签到一次（幂等）
 ```
 
-## 👥 多账号隔离
+云端与定时任务：
 
-WorkBuddy 桌面端是**单账号登录态**，多账号并存需用「登录态快照 + `WB_CHECKIN_AUTH_FILE` 指定」方案：
+```bash
+bash scripts/cloud-init.sh --verify   # 创建私有仓库 + 写 Secrets + 验证
+bash scripts/local-cron.sh            # macOS/Linux 定时
+powershell -ExecutionPolicy Bypass -File scripts\local-task.ps1   # Windows 定时
+```
 
-1. 桌面端每次登录会在 auth 目录留存带时间戳的 `workbuddy-desktop.<ts>.<pid>.<uuid>.info` 快照，复制各账号快照到仓库 `auth/<账号>.info`
-2. 设 `WB_CHECKIN_AUTH_FILE=<快照路径>` 指定读取对应账号
-3. 云端 Secrets 用后缀隔离（`WORKBUDDY_ACCESS_TOKEN` vs `_2`）
+## 安全边界
 
-完整流程见 `SKILL.md` 的「多账号彻底隔离与快照保鲜」章节。
+- 令牌（`accessToken`）等同账号密码。它只在内存中流转，**不进日志、不回显、不提交**。
+- 唯一的落盘位置是 `auth/<账号>.info`（已 `.gitignore`），用于让下游脚本摆脱桌面端依赖。
+- 全部网络请求只发往 `copilot.tencent.com` 官方接口。
+- 云端 Secret 通过 `gh secret set` 从 stdin 写入，不出现在命令行历史里。
+- 请只用于**你自己的账号**。批量刷分等违反用户协议的行为不在本项目支持范围内。
 
-## ☁️ 云端签到（可选，关机也能签）
+## 许可
 
-fork 本仓库 → 设为**私有** → 配置 GitHub Actions + Secrets（`WORKBUDDY_ACCESS_TOKEN` / `WORKBUDDY_UID` / `WORKBUDDY_DOMAIN`），由本机定时回传 token 保鲜。完整流程见 `SKILL.md`。
-
-## 🔑 环境变量
-
-| 变量 | 作用 |
-|------|------|
-| `WB_CHECKIN_NODE=<path>` | 指定 Node 二进制路径 |
-| `WB_CHECKIN_ELECTRON=<path>` | 指定 Electron 二进制路径（仅旧版） |
-| `WB_CHECKIN_APP_NAME=CodeBuddy` | 兼容旧版应用名（仅旧版 macOS 钥匙串） |
-| `WB_CHECKIN_JITTER=<秒>` | 启动前随机等待 0~N 秒 |
-| `WB_CHECKIN_AUTH_FILE=<path>` | **多账号隔离**：指定登录态 JSON 文件 |
-
-## ⚠️ 安全说明
-
-> **凭据即账号密码**：解密的 `accessToken` 等同你的 WorkBuddy 账号密码。
-
-- 令牌仅在内存中使用，通过管道立即被签到请求消费，不落盘、不回显、不提交仓库
-- `logs/` 仅记录签到结果，绝不含令牌原文
-- 网络访问仅发往腾讯官方接口 `copilot.tencent.com`
-- **请勿用于他人账户、批量注册刷分或任何违反用户协议的用途，使用者自行承担风险**
-
-## 📄 License
-
-[MIT](./LICENSE)
+MIT。使用风险自负，与 WorkBuddy 官方无关。

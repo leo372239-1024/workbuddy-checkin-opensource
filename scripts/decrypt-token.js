@@ -14,6 +14,10 @@
  *
  * 依赖：
  *   - 新版明文分支：仅需 Node.js（无版本特殊要求），纯 Node 读取 JSON。
+ *   - $wbEncrypted 信封分支：需要 WorkBuddy 桌面端可执行文件（v5.6+ 字段级加密）。
+ *     通过 ELECTRON_RUN_AS_NODE=1 以 Node 模式启动该可执行文件，调用其内置原生绑定
+ *     electron_browser_workbuddy_storage.loggerGet() 取回 at-rest 密钥，再解 AES-256-GCM 信封。
+ *     用 WB_CHECKIN_APP_EXE 显式指定可执行文件路径；未设置时从 WORKBUDDY_APP_PATH 推断。
  *   - 旧版 state.vscdb 分支：需要 Electron 运行时（≥ 30，使用 node:sqlite + safeStorage）。
  *
  * 运行方式（两种都支持，调用方按运行时可用性选择）：
@@ -44,6 +48,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 
 // Electron 仅旧版 state.vscdb 分支需要；try/catch 使脚本可在纯 node 下执行。
@@ -156,32 +161,173 @@ function toBuffer(parsed) {
 }
 
 // ============================================================
+// $wbEncrypted 信封解密（WorkBuddy 5.6+ 字段级加密，scheme "sym-v1"）
+// ------------------------------------------------------------
+// 信封结构：{ suite: 1, keyId, nonce, authTag, ciphertext }（后三者 base64）
+// 密钥派生：protectorKey = sha256(utf8(atRestSecretKey))，keyId = sha256(protectorKey).hex[:16]
+// 加密参数：AES-256-GCM，nonce 12B，tag 16B，AAD 为长度前缀 transcript（见 fieldAad）
+// atRestSecretKey 不落盘，只能由桌面端自身运行时通过原生绑定取回。
+// ============================================================
+
+const ENVELOPE_MARK = "$wbEncrypted";
+
+function isEnvelope(v) {
+  return !!v && typeof v === "object" && v[ENVELOPE_MARK] && typeof v.envelope === "string";
+}
+
+// 定位 WorkBuddy 桌面端可执行文件（ELECTRON_RUN_AS_NODE 模式调用原生绑定用）
+function findAppExe() {
+  const explicit = process.env.WB_CHECKIN_APP_EXE || "";
+  if (explicit && fs.existsSync(explicit)) return explicit;
+
+  const exeNames =
+    process.platform === "win32"
+      ? ["WorkBuddyAI.exe", "WorkBuddy.exe", "CodeBuddy.exe"]
+      : ["WorkBuddy", "CodeBuddy"];
+
+  // 1) 从运行中的 WorkBuddy 应用路径推断：<root>/resources/app.asar → <root>/
+  const appPath = process.env.WORKBUDDY_APP_PATH || "";
+  const roots = [];
+  if (appPath) roots.push(path.dirname(path.dirname(appPath)));
+
+  // 2) 常见安装位置
+  if (process.platform === "win32") {
+    const localAp = process.env.LOCALAPPDATA || "";
+    const pf = process.env.ProgramFiles || "C:\\Program Files";
+    const pfx86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+    for (const d of [
+      path.join(localAp, "Programs", "WorkBuddy AI"),
+      path.join(localAp, "Programs", "WorkBuddy"),
+      path.join(pf, "WorkBuddy AI"),
+      path.join(pf, "WorkBuddy"),
+      path.join(pfx86, "WorkBuddy"),
+    ]) roots.push(d);
+  } else if (process.platform === "darwin") {
+    roots.push("/Applications/WorkBuddy.app/Contents/MacOS");
+    roots.push(path.join(os.homedir(), "Applications", "WorkBuddy.app", "Contents", "MacOS"));
+  }
+
+  for (const r of roots) {
+    for (const n of exeNames) {
+      const p = path.join(r, n);
+      if (fs.existsSync(p)) return p;
+    }
+  }
+  return "";
+}
+
+// 取回编译期 build key payload（含 atRestSecretKey）
+function getAtRestKeyPayload(exePath) {
+  const code =
+    "const m=process._linkedBinding('electron_browser_workbuddy_storage');" +
+    "process.stdout.write(m.loggerGet());";
+  const out = execFileSync(exePath, [ "-e", code ], {
+    encoding: "utf8",
+    timeout: 20000,
+    windowsHide: true,
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+  }).trim();
+  const payload = JSON.parse(out);
+  if (!payload || typeof payload.atRestSecretKey !== "string") {
+    throw new Error("原生绑定未返回 atRestSecretKey");
+  }
+  return payload;
+}
+
+function deriveProtectorKey(atRestSecretKey) {
+  return crypto.createHash("sha256").update(atRestSecretKey, "utf8").digest();
+}
+
+// 长度前缀编码：uint32BE(len) || bytes
+function lenPrefixed(buf) {
+  const l = Buffer.alloc(4);
+  l.writeUInt32BE(buf.length, 0);
+  return Buffer.concat([ l, buf ]);
+}
+
+// field framing 的 AAD（逆向自客户端 transcript 构造）
+function fieldAad(keyId, suite) {
+  const s = Buffer.alloc(4);
+  s.writeUInt32BE(suite >>> 0, 0);
+  return Buffer.concat([
+    Buffer.from("WB-AAD\u0000", "latin1"),
+    Buffer.from([ 0x01 ]),
+    lenPrefixed(Buffer.from("WBEV1", "utf8")),
+    lenPrefixed(Buffer.from("sym-v1", "utf8")),
+    s,
+    lenPrefixed(Buffer.from(keyId, "utf8")),
+    Buffer.from([ 0x02 ]), // FRAMING_CODE.field
+    Buffer.from([ 0x00 ]), // optU64(sequence) 缺省
+    Buffer.from([ 0x00 ]), // final 标志缺省
+  ]);
+}
+
+function decryptEnvelope(envObj, protectorKey) {
+  const env = JSON.parse(Buffer.from(envObj.envelope, "base64").toString("utf8"));
+  const d = crypto.createDecipheriv("aes-256-gcm", protectorKey, Buffer.from(env.nonce, "base64"));
+  d.setAAD(fieldAad(env.keyId, env.suite));
+  d.setAuthTag(Buffer.from(env.authTag, "base64"));
+  return Buffer.concat([ d.update(Buffer.from(env.ciphertext, "base64")), d.final() ]).toString("utf8");
+}
+
+// ============================================================
 // 主流程：新版明文文件优先，旧版 state.vscdb 回退
 // ============================================================
 
-// 1. 新版明文认证文件（WorkBuddy v5.3.8+，纯 Node 读取，优先）
-// 命中且含 accessToken 即输出；文件缺失 / 无 token / 解析失败均不硬失败，
+// 1. 新版认证文件（WorkBuddy v5.3.8+，优先）
+//    - accessToken 为明文字符串：直接使用；
+//    - accessToken 为 $wbEncrypted 信封对象（v5.6+）：用桌面端原生绑定取密钥后解密。
+// 命中且拿到 token 即输出；文件缺失 / 无 token / 解析失败均不硬失败，
 // 统一落入下方旧版 state.vscdb 分支兜底（覆盖升级中途、文件写入中等场景）。
+let envelopeErr = "";
 for (const f of desktopAuthFileCandidates()) {
   if (!fs.existsSync(f)) continue;
   try {
     const j = JSON.parse(fs.readFileSync(f, "utf8"));
-    const token = j && j.auth && j.auth.accessToken;
-    if (token && typeof token === "string") {
+    const tokenRaw = j && j.auth && j.auth.accessToken;
+    let token = "";
+    let fromEnvelope = false;
+
+    if (tokenRaw && typeof tokenRaw === "string") {
+      token = tokenRaw;
+    } else if (isEnvelope(tokenRaw)) {
+      const exe = findAppExe();
+      if (!exe) {
+        envelopeErr = "登录态为 $wbEncrypted 加密信封，但未找到 WorkBuddy 桌面端可执行文件（请设置 WB_CHECKIN_APP_EXE）";
+      } else {
+        try {
+          const payload = getAtRestKeyPayload(exe);
+          const protectorKey = deriveProtectorKey(payload.atRestSecretKey);
+          const env = JSON.parse(Buffer.from(tokenRaw.envelope, "base64").toString("utf8"));
+          const expectId = crypto.createHash("sha256").update(protectorKey).digest("hex").slice(0, 16);
+          if (env.keyId !== expectId) {
+            envelopeErr = "信封 keyId 校验失败（本机密钥与登录态不匹配，可能来自其他机器/账户）";
+          } else {
+            token = decryptEnvelope(tokenRaw, protectorKey);
+            fromEnvelope = true;
+          }
+        } catch (e) {
+          envelopeErr = "$wbEncrypted 信封解密失败（" + e.message + "）";
+        }
+      }
+    }
+
+    if (token) {
       const acct = j && j.account;
       const authObj = j && j.auth;
       const uid = acct && acct.uid != null ? String(acct.uid) : "";
       const domain = authObj && authObj.domain != null ? String(authObj.domain) : "";
       const eid = acct && acct.enterpriseId != null ? String(acct.enterpriseId) : "";
       process.stderr.write(
-        "[安全提示] 已从本地登录态读取 accessToken（新版明文存储），仅用于 WorkBuddy 官方签到接口；" +
-        "请勿将其写入日志、分享或提交。\n"
+        "[安全提示] 已从本地登录态读取 accessToken（" +
+        (fromEnvelope ? "v5.6+ $wbEncrypted 信封解密" : "新版明文存储") +
+        "），仅用于 WorkBuddy 官方签到接口；请勿将其写入日志、分享或提交。\n"
       );
       // 额外输出 uid/domain/enterpriseId，供 checkin 脚本拼装 X-User-Id 等鉴权头（逆向自客户端 buildHeaders）
       emitAndExit(0, "DECRYPT_RESULT:" + token + "\nACCOUNT_UID:" + uid + "\nAUTH_DOMAIN:" + domain + "\nENTERPRISE_ID:" + eid);
       return;
     }
-    // 文件存在但无 accessToken：落入旧版分支兜底
+    // 文件存在但取不到 token：落入旧版分支兜底
   } catch (e) {
     // 解析失败（文件损坏 / 写入中）：忽略，落入旧版分支兜底
   }
@@ -190,9 +336,11 @@ for (const f of desktopAuthFileCandidates()) {
 // 2. 回退：旧版 state.vscdb + Electron safeStorage
 if (!app || !safeStorage) {
   // 纯 Node 运行且无新版明文文件：无法走 safeStorage 分支，给出明确指引。
+  const envHint = envelopeErr ? "（" + envelopeErr + "）" : "";
   emitAndExit(
     6,
-    "DECRYPT_RESULT:ERR 未找到新版明文认证文件，且当前为纯 Node 运行（无 Electron）无法解密旧版 state.vscdb。" +
+    "DECRYPT_RESULT:ERR 未找到可用的新版认证文件，且当前为纯 Node 运行（无 Electron）无法解密旧版 state.vscdb。" +
+    envHint +
     "请确认已安装并登录 WorkBuddy 桌面端 v5.3.8+；旧版账户请改用 Electron 运行时执行本脚本。"
   );
   return;
@@ -220,8 +368,11 @@ for (const p of legacyVscdbCandidates()) {
 }
 if (!raw) {
   // 读取旧版库本身报错时附带原因，避免「未知原因」式失败（issue #68 投诉点）
-  const hint = legacyReadErr ? "（读取旧版 state.vscdb 失败：" + legacyReadErr.message + "）" : "";
-  emitAndExit(2, "DECRYPT_RESULT:ERR 未找到 WorkBuddy 本地登录态（新版明文文件与旧版 state.vscdb 均未命中" + hint + "，请先安装并登录 WorkBuddy 桌面端）");
+  const parts = [];
+  if (legacyReadErr) parts.push("读取旧版 state.vscdb 失败：" + legacyReadErr.message);
+  if (envelopeErr) parts.push(envelopeErr);
+  const hint = parts.length ? "（" + parts.join("；") + "）" : "";
+  emitAndExit(2, "DECRYPT_RESULT:ERR 未找到 WorkBuddy 本地登录态（新版认证文件与旧版 state.vscdb 均未命中" + hint + "，请先安装并登录 WorkBuddy 桌面端）");
   return;
 }
 

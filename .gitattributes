@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF：LF 的 .cmd 会被 cmd.exe 静默空跑
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# PowerShell 按 Windows 惯例
+*.ps1 text eol=crlf
+
+# 脚本一律 LF：\r 混进变量值会让字符串比较/排序出现莫名异常
+*.sh text eol=lf
+*.js text eol=lf
+*.py text eol=lf

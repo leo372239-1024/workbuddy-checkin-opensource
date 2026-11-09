@@ -1,0 +1,69 @@
+name: WorkBuddy Daily Checkin - __ACCOUNT_NAME__
+
+on:
+  schedule:
+    # 北京时间每日 __CRON_BJ__（cron 为 UTC：__CRON_UTC__，即 UTC __CRON_UTC_LABEL__）
+    # 注意：GitHub Actions 定时任务实测排队延迟 3~4 小时，它是「当天最后一道保险」，
+    # 不是准点兜底。不要用它替代上班时间的签到。
+    - cron: "__CRON_UTC__"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: workbuddy-checkin-__ACCOUNT_SLUG__
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      # 签到失败不中断，否则后面的告警步骤不会执行
+      - name: Run checkin
+        id: checkin
+        env:
+          WB_ACCOUNT_NAME: __ACCOUNT_NAME__
+          WORKBUDDY_ACCESS_TOKEN: ${{ secrets.WORKBUDDY_ACCESS_TOKEN }}
+          WORKBUDDY_UID: ${{ secrets.WORKBUDDY_UID }}
+          WORKBUDDY_DOMAIN: ${{ secrets.WORKBUDDY_DOMAIN }}
+          WORKBUDDY_ENTERPRISE_ID: ${{ secrets.WORKBUDDY_ENTERPRISE_ID }}
+        run: |
+          set +e
+          python checkin.py 2>&1 | tee checkin.log
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Notify on failure
+        if: steps.checkin.outputs.exit_code != '0'
+        continue-on-error: true
+        env:
+          WB_ACCOUNT_NAME: __ACCOUNT_NAME__
+          WB_EXIT_CODE: ${{ steps.checkin.outputs.exit_code }}
+          WB_LOG_FILE: checkin.log
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKBUDDY_ACCESS_TOKEN: ${{ secrets.WORKBUDDY_ACCESS_TOKEN }}
+          MAIL_SMTP_HOST: ${{ secrets.MAIL_SMTP_HOST }}
+          MAIL_SMTP_PORT: ${{ secrets.MAIL_SMTP_PORT }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python notify.py --failure
+
+      - name: Mark job failed
+        if: steps.checkin.outputs.exit_code != '0'
+        run: |
+          echo "::error::签到失败，退出码 ${{ steps.checkin.outputs.exit_code }}，已尝试发送告警"
+          exit 1
